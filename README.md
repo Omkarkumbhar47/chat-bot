@@ -21,22 +21,38 @@ This repository is now split into proper `frontend/` and `backend/` applications
 
 1. Frontend dependencies are already present in `frontend/node_modules` in this workspace. If needed, run `npm install` inside `frontend`.
 2. Create `backend/.env` from `backend/.env.example` and add your real API keys.
-3. Start the backend:
+3. Optional: create `frontend/.env` from `frontend/.env.example`.
+For local development you can use:
+
+```bash
+VITE_API_BASE_URL=http://localhost:3001
+```
+
+4. Start the backend:
 
 ```bash
 npm run dev:backend
 ```
 
-4. Start the frontend in a second terminal:
+5. Start the frontend in a second terminal:
 
 ```bash
 npm run dev:frontend
 ```
 
-The frontend runs on `http://localhost:5173` and proxies `/api/chat` to the backend on `http://localhost:3001`.
+The frontend runs on `http://localhost:5173`.
+
+Locally, the app works in either of these ways:
+- with `frontend/.env` set to `http://localhost:3001`
+- or without a frontend env file by falling back to the Vite `/api` proxy
 
 ## Notes
 
 - OpenAI and Groq use native streaming through the backend.
 - Gemini and Claude still stream through the UI endpoint, but their backend responses are finalized in a single chunk because this project keeps provider integration lightweight.
 - Backend requests validate message count and message length before calling external providers.
+- For deployment, set `VITE_API_BASE_URL` in Vercel to your Render backend URL, for example:
+
+```bash
+VITE_API_BASE_URL=https://chat-bot-backend-gg18.onrender.com
+```

@@ -1,5 +1,7 @@
 import { createSlice } from "@reduxjs/toolkit";
 
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+
 const createChat = () => ({
   id: createChatId(),
   title: "New chat",
@@ -129,7 +131,7 @@ export const sendMessage = () => async (dispatch, getState) => {
 };
 
 async function requestChatStream(payload) {
-  const response = await fetch("/api/chat/stream", {
+  const response = await fetch(buildApiUrl("/api/chat/stream"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -141,13 +143,17 @@ async function requestChatStream(payload) {
     return response;
   }
 
-  return fetch("/api/chat", {
+  return fetch(buildApiUrl("/api/chat"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
   });
+}
+
+function buildApiUrl(path) {
+  return API_BASE_URL ? `${API_BASE_URL}${path}` : path;
 }
 
 const chatSlice = createSlice({
