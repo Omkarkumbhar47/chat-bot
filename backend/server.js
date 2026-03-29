@@ -6,6 +6,10 @@ const ENV_PATH = resolve(process.cwd(), ".env");
 const PORT = Number(process.env.PORT || 3001);
 const MAX_MESSAGES = 50;
 const MAX_MESSAGE_LENGTH = 8000;
+const CONFIGURED_ORIGINS = (process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 loadEnvFile(ENV_PATH);
 
@@ -107,8 +111,10 @@ const MODEL_CONFIG = {
 };
 
 const server = createServer(async (request, response) => {
+  const requestOrigin = request.headers.origin;
+
   if (request.method === "OPTIONS") {
-    response.writeHead(204, corsHeaders());
+    response.writeHead(204, corsHeaders(requestOrigin));
     response.end();
     return;
   }
@@ -132,12 +138,13 @@ server.listen(PORT, () => {
 
 async function handleChatRequest(request, response, shouldStream) {
   try {
+    const requestOrigin = request.headers.origin;
     const body = await readJsonBody(request);
     const model = body?.model;
     const rawMessages = body?.messages;
 
     if (!MODEL_CONFIG[model]) {
-      sendJson(response, 400, { error: "Unsupported model selected." });
+      sendJson(response, 400, { error: "Unsupported model selected." }, requestOrigin);
       return;
     }
 
@@ -146,12 +153,17 @@ async function handleChatRequest(request, response, shouldStream) {
     const apiKey = process.env[config.envKey];
 
     if (!apiKey) {
-      sendJson(response, 500, { error: `Missing ${config.envKey} in server environment.` });
+      sendJson(
+        response,
+        500,
+        { error: `Missing ${config.envKey} in server environment.` },
+        requestOrigin,
+      );
       return;
     }
 
     if (shouldStream) {
-      await streamProviderResponse(response, config, messages);
+      await streamProviderResponse(response, config, messages, requestOrigin);
       return;
     }
 
@@ -162,24 +174,24 @@ async function handleChatRequest(request, response, shouldStream) {
     if (!upstreamResponse.ok) {
       sendJson(response, upstreamResponse.status, {
         error: extractProviderError(data),
-      });
+      }, requestOrigin);
       return;
     }
 
     const message = config.parse(data);
 
     if (!message) {
-      sendJson(response, 502, { error: "Provider returned an empty response." });
+      sendJson(response, 502, { error: "Provider returned an empty response." }, requestOrigin);
       return;
     }
 
-    sendJson(response, 200, { message });
+    sendJson(response, 200, { message }, requestOrigin);
   } catch (error) {
-    sendJson(response, 500, { error: error.message || "Server error." });
+    sendJson(response, 500, { error: error.message || "Server error." }, request.headers.origin);
   }
 }
 
-async function streamProviderResponse(response, config, messages) {
+async function streamProviderResponse(response, config, messages, requestOrigin) {
   if (!config.supportsStreaming) {
     const upstreamConfig = config.buildRequest(messages);
     const upstreamResponse = await fetch(upstreamConfig.url, upstreamConfig.options);
@@ -189,7 +201,7 @@ async function streamProviderResponse(response, config, messages) {
       sendSse(response, {
         type: "error",
         error: extractProviderError(data),
-      });
+      }, requestOrigin);
       response.end();
       return;
     }
@@ -197,16 +209,16 @@ async function streamProviderResponse(response, config, messages) {
     const message = config.parse(data);
 
     if (message) {
-      sendSse(response, { type: "delta", delta: message });
+      sendSse(response, { type: "delta", delta: message }, requestOrigin);
     }
 
-    sendSse(response, { type: "done" });
+    sendSse(response, { type: "done" }, requestOrigin);
     response.end();
     return;
   }
 
   response.writeHead(200, {
-    ...corsHeaders(),
+    ...corsHeaders(requestOrigin),
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
@@ -220,7 +232,7 @@ async function streamProviderResponse(response, config, messages) {
     sendSse(response, {
       type: "error",
       error: extractProviderError(data),
-    });
+    }, requestOrigin);
     response.end();
     return;
   }
@@ -229,7 +241,7 @@ async function streamProviderResponse(response, config, messages) {
     sendSse(response, {
       type: "error",
       error: "Streaming response body was unavailable.",
-    });
+    }, requestOrigin);
     response.end();
     return;
   }
@@ -258,7 +270,7 @@ async function streamProviderResponse(response, config, messages) {
 
       for (const line of dataLines) {
         if (line === "[DONE]") {
-          sendSse(response, { type: "done" });
+          sendSse(response, { type: "done" }, requestOrigin);
           response.end();
           return;
         }
@@ -267,7 +279,7 @@ async function streamProviderResponse(response, config, messages) {
           const delta = config.parseStreamLine(line);
 
           if (delta) {
-            sendSse(response, { type: "delta", delta });
+            sendSse(response, { type: "delta", delta }, requestOrigin);
           }
         } catch {
           // Ignore malformed stream lines and continue consuming the provider stream.
@@ -276,7 +288,7 @@ async function streamProviderResponse(response, config, messages) {
     }
   }
 
-  sendSse(response, { type: "done" });
+  sendSse(response, { type: "done" }, requestOrigin);
   response.end();
 }
 
@@ -325,24 +337,53 @@ function extractProviderError(data) {
   return data?.error?.message || data?.error || data?.message || "Provider request failed.";
 }
 
-function corsHeaders() {
+function corsHeaders(requestOrigin) {
+  const allowedOrigin = getAllowedOrigin(requestOrigin);
+
   return {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": allowedOrigin,
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
+    Vary: "Origin",
   };
 }
 
-function sendJson(response, statusCode, payload) {
+function sendJson(response, statusCode, payload, requestOrigin) {
   response.writeHead(statusCode, {
-    ...corsHeaders(),
+    ...corsHeaders(requestOrigin),
     "Content-Type": "application/json",
   });
   response.end(JSON.stringify(payload));
 }
 
-function sendSse(response, payload) {
+function sendSse(response, payload, requestOrigin) {
+  if (!response.headersSent) {
+    response.writeHead(200, {
+      ...corsHeaders(requestOrigin),
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    });
+  }
+
   response.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function getAllowedOrigin(requestOrigin) {
+  if (!requestOrigin) {
+    return "*";
+  }
+
+  if (
+    requestOrigin.startsWith("http://localhost:") ||
+    requestOrigin.startsWith("http://127.0.0.1:") ||
+    requestOrigin.endsWith(".vercel.app") ||
+    CONFIGURED_ORIGINS.includes(requestOrigin)
+  ) {
+    return requestOrigin;
+  }
+
+  return CONFIGURED_ORIGINS[0] || "*";
 }
 
 function loadEnvFile(filePath) {
