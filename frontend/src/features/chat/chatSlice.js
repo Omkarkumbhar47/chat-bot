@@ -15,7 +15,7 @@ const initialState = {
   activeChatId: initialChat.id,
   loading: false,
   error: null,
-  selectedModel: "openai",
+  selectedModel: "groq",
 };
 
 export const sendMessage = createAsyncThunk(
@@ -34,6 +34,7 @@ export const sendMessage = createAsyncThunk(
         headers: {
           "Content-Type": "application/json",
         },
+        // The backend keeps provider API keys off the client and normalizes responses.
         body: JSON.stringify({
           model: selectedModel,
           messages: activeChat.messages,
@@ -78,6 +79,7 @@ const chatSlice = createSlice({
       activeChat.messages.push({ role: "user", content: action.payload });
       activeChat.updatedAt = Date.now();
 
+      // Use the first prompt as a lightweight session title for the history list.
       if (activeChat.title === "New chat") {
         activeChat.title = buildChatTitle(action.payload);
       }

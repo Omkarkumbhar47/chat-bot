@@ -13,6 +13,8 @@ export const store = configureStore({
 });
 
 store.subscribe(() => {
+  // Persist only for the current browser session so refresh restores the chat
+  // without turning the app into a permanent inbox for every visit.
   saveChatState(store.getState().chat);
 });
 

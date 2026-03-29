@@ -7,6 +7,8 @@ const PORT = Number(process.env.PORT || 3001);
 
 loadEnvFile(ENV_PATH);
 
+// Each provider has slightly different request/response shapes, so the server
+// adapts them into one consistent { message } payload for the frontend.
 const MODEL_CONFIG = {
   openai: {
     envKey: "OPENAI_API_KEY",
@@ -177,6 +179,7 @@ function loadEnvFile(filePath) {
     return;
   }
 
+  // Lightweight .env loader keeps the backend dependency-free for the assignment.
   const fileContents = readFileSync(filePath, "utf8");
 
   for (const line of fileContents.split(/\r?\n/)) {
