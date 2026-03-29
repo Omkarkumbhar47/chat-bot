@@ -8,6 +8,7 @@ import {
   faPaperPlane,
   faPlus,
   faRobot,
+  faSpinner,
   faTriangleExclamation,
   faWandMagicSparkles,
 } from "@fortawesome/free-solid-svg-icons";
@@ -39,6 +40,8 @@ const Chat = () => {
   const [input, setInput] = useState("");
   const [theme, setTheme] = useState("dark");
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isSidebarAnimating, setIsSidebarAnimating] = useState(false);
+  const [isCreatingChat, setIsCreatingChat] = useState(false);
   const messagesEndRef = useRef(null);
   const dispatch = useDispatch();
   const { activeChatId, chats, error, loading, selectedModel } = useSelector(
@@ -47,6 +50,7 @@ const Chat = () => {
 
   const activeChat = chats.find((chat) => chat.id === activeChatId);
   const messages = activeChat?.messages ?? emptyMessages;
+  const isStreamingMessageVisible = messages.some((message) => message.isStreaming);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -58,6 +62,20 @@ const Chat = () => {
       document.documentElement.dataset.theme = "dark";
     };
   }, [theme]);
+
+  useEffect(() => {
+    if (!isSidebarAnimating) {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setIsSidebarAnimating(false);
+    }, 300);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [isSidebarAnimating]);
 
   const handleSend = () => {
     if (!input.trim() || loading) {
@@ -76,6 +94,20 @@ const Chat = () => {
     }
   };
 
+  const handleCreateNewChat = () => {
+    setIsCreatingChat(true);
+    dispatch(createNewChat());
+
+    window.setTimeout(() => {
+      setIsCreatingChat(false);
+    }, 180);
+  };
+
+  const handleToggleSidebar = () => {
+    setIsSidebarAnimating(true);
+    setIsSidebarOpen((current) => !current);
+  };
+
   return (
     <div className="flex h-screen overflow-hidden bg-[hsl(var(--background))] text-[hsl(var(--foreground))]">
       <aside
@@ -86,11 +118,15 @@ const Chat = () => {
       >
         <div className="shrink-0  p-4">
           <Button
-            onClick={() => dispatch(createNewChat())}
+            onClick={handleCreateNewChat}
             className="w-full justify-start gap-2 rounded-2xl py-3"
+            disabled={isCreatingChat}
           >
-            <FontAwesomeIcon icon={faPlus} className="text-sm" />
-            <span>New chat</span>
+            <FontAwesomeIcon
+              icon={isCreatingChat ? faSpinner : faPlus}
+              className={cn("text-sm", isCreatingChat && "animate-spin")}
+            />
+            <span>{isCreatingChat ? "Creating..." : "New chat"}</span>
           </Button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-3">
@@ -137,24 +173,34 @@ const Chat = () => {
           <div className="mx-auto flex w-full max-w-5xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-3">
               <Button
-                onClick={() => setIsSidebarOpen((current) => !current)}
+                onClick={handleToggleSidebar}
                 variant="outline"
                 size="icon"
                 className="shrink-0"
+                disabled={isSidebarAnimating}
               >
                 <FontAwesomeIcon
-                  icon={isSidebarOpen ? faChevronLeft : faChevronRight}
-                  className="hidden lg:inline-block"
+                  icon={
+                    isSidebarAnimating
+                      ? faSpinner
+                      : isSidebarOpen
+                        ? faChevronLeft
+                        : faChevronRight
+                  }
+                  className={cn("text-sm", isSidebarAnimating && "animate-spin")}
                 />
-                {/* <FontAwesomeIcon icon={faBars} className="lg:hidden" /> */}
               </Button>
               <Button
-                onClick={() => dispatch(createNewChat())}
+                onClick={handleCreateNewChat}
                 variant="outline"
                 className="gap-2 sm:inline-flex lg:hidden"
+                disabled={isCreatingChat}
               >
-                <FontAwesomeIcon icon={faPlus} className="text-sm" />
-                <span>New Chat</span>
+                <FontAwesomeIcon
+                  icon={isCreatingChat ? faSpinner : faPlus}
+                  className={cn("text-sm", isCreatingChat && "animate-spin")}
+                />
+                <span>{isCreatingChat ? "Creating..." : "New Chat"}</span>
               </Button>
               <div>
                 <h1 className="flex items-center gap-2 text-xl font-bold">
@@ -216,7 +262,7 @@ const Chat = () => {
                     </div>
                   ))}
 
-                  {loading && (
+                  {loading && !isStreamingMessageVisible && (
                     <div className="flex justify-start">
                       <div className="max-w-[85%] rounded-2xl bg-[hsl(var(--secondary))] px-4 py-3 text-[hsl(var(--secondary-foreground))] shadow-lg sm:max-w-xl">
                         <div className="flex items-center gap-2 text-sm">

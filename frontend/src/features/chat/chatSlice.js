@@ -1,4 +1,4 @@
-import { createAsyncThunk, createSlice } from "@reduxjs/toolkit";
+import { createSlice } from "@reduxjs/toolkit";
 
 const createChat = () => ({
   id: createChatId(),
@@ -18,52 +18,137 @@ const initialState = {
   selectedModel: "groq",
 };
 
-export const sendMessage = createAsyncThunk(
-  "chat/sendMessage",
-  async (_, { getState, rejectWithValue }) => {
-    try {
-      const { chats, activeChatId, selectedModel } = getState().chat;
-      const activeChat = chats.find((chat) => chat.id === activeChatId);
+export const sendMessage = () => async (dispatch, getState) => {
+  const { chats, activeChatId, selectedModel } = getState().chat;
+  const activeChat = chats.find((chat) => chat.id === activeChatId);
 
-      if (!activeChat || activeChat.messages.length === 0) {
-        throw new Error("Start a conversation before sending it.");
-      }
+  if (!activeChat || activeChat.messages.length === 0) {
+    dispatch(setError("Start a conversation before sending it."));
+    return;
+  }
 
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        // The backend keeps provider API keys off the client and normalizes responses.
-        body: JSON.stringify({
-          model: selectedModel,
-          messages: activeChat.messages,
-        }),
-      });
+  const messagesSnapshot = activeChat.messages.map((message) => ({
+    role: message.role,
+    content: message.content,
+  }));
 
+  dispatch(startStreamingResponse());
+
+  try {
+    const payload = {
+      model: selectedModel,
+      messages: messagesSnapshot,
+    };
+    const response = await requestChatStream(payload);
+
+    if (!response.ok) {
       const rawBody = await response.text();
       const data = rawBody ? JSON.parse(rawBody) : null;
-
-      if (!response.ok) {
-        throw new Error(data?.error || "Unable to fetch AI response");
-      }
-
-      return data?.message || "";
-    } catch (error) {
-      if (error instanceof SyntaxError) {
-        return rejectWithValue("The chat server returned an invalid response.");
-      }
-
-      if (error instanceof TypeError) {
-        return rejectWithValue(
-          "The chat server is unavailable. Start it with `npm run dev:backend` and try again.",
-        );
-      }
-
-      return rejectWithValue(error.message || "An error occurred");
+      throw new Error(data?.error || "Unable to fetch AI response.");
     }
-  },
-);
+
+    if (response.headers.get("content-type")?.includes("application/json")) {
+      const data = await response.json();
+      dispatch(appendStreamingResponse(data?.message || ""));
+      dispatch(finishStreamingResponse());
+      return;
+    }
+
+    if (!response.body) {
+      throw new Error("The chat server did not return a stream.");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop() || "";
+
+      for (const event of events) {
+        const dataLine = event
+          .split("\n")
+          .find((line) => line.startsWith("data:"));
+
+        if (!dataLine) {
+          continue;
+        }
+
+        const payload = dataLine.slice(5).trim();
+
+        if (!payload) {
+          continue;
+        }
+
+        if (payload === "[DONE]") {
+          dispatch(finishStreamingResponse());
+          return;
+        }
+
+        const parsed = JSON.parse(payload);
+
+        if (parsed.type === "delta" && parsed.delta) {
+          dispatch(appendStreamingResponse(parsed.delta));
+        }
+
+        if (parsed.type === "error") {
+          throw new Error(parsed.error || "Streaming failed.");
+        }
+
+        if (parsed.type === "done") {
+          dispatch(finishStreamingResponse());
+          return;
+        }
+      }
+    }
+
+    dispatch(finishStreamingResponse());
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      dispatch(failStreamingResponse("The chat server returned an invalid response."));
+      return;
+    }
+
+    if (error instanceof TypeError) {
+      dispatch(
+        failStreamingResponse("Unable to reach the chat server right now. Please try again."),
+      );
+      return;
+    }
+
+    dispatch(failStreamingResponse(error.message || "An error occurred."));
+  }
+};
+
+async function requestChatStream(payload) {
+  const response = await fetch("/api/chat/stream", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (response.status !== 404) {
+    return response;
+  }
+
+  return fetch("/api/chat", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+}
 
 const chatSlice = createSlice({
   name: "chat",
@@ -84,6 +169,74 @@ const chatSlice = createSlice({
         activeChat.title = buildChatTitle(action.payload);
       }
     },
+    startStreamingResponse: (state) => {
+      const activeChat = getActiveChat(state);
+
+      state.loading = true;
+      state.error = null;
+
+      if (!activeChat) {
+        return;
+      }
+
+      activeChat.messages.push({ role: "assistant", content: "", isStreaming: true });
+      activeChat.updatedAt = Date.now();
+    },
+    appendStreamingResponse: (state, action) => {
+      const activeChat = getActiveChat(state);
+
+      if (!activeChat) {
+        return;
+      }
+
+      const streamingMessage = [...activeChat.messages]
+        .reverse()
+        .find((message) => message.role === "assistant" && message.isStreaming);
+
+      if (!streamingMessage) {
+        return;
+      }
+
+      streamingMessage.content += action.payload;
+      activeChat.updatedAt = Date.now();
+    },
+    finishStreamingResponse: (state) => {
+      const activeChat = getActiveChat(state);
+
+      state.loading = false;
+
+      if (!activeChat) {
+        return;
+      }
+
+      const streamingMessage = [...activeChat.messages]
+        .reverse()
+        .find((message) => message.role === "assistant" && message.isStreaming);
+
+      if (!streamingMessage) {
+        return;
+      }
+
+      streamingMessage.isStreaming = false;
+      streamingMessage.content = streamingMessage.content.trim() || "No response received.";
+      activeChat.updatedAt = Date.now();
+    },
+    failStreamingResponse: (state, action) => {
+      const activeChat = getActiveChat(state);
+
+      state.loading = false;
+      state.error = action.payload;
+
+      if (!activeChat) {
+        return;
+      }
+
+      activeChat.messages = activeChat.messages.filter((message) => !message.isStreaming);
+      activeChat.updatedAt = Date.now();
+    },
+    setError: (state, action) => {
+      state.error = action.payload;
+    },
     clearError: (state) => {
       state.error = null;
     },
@@ -102,29 +255,6 @@ const chatSlice = createSlice({
       state.error = null;
     },
   },
-  extraReducers: (builder) => {
-    builder
-      .addCase(sendMessage.pending, (state) => {
-        state.loading = true;
-        state.error = null;
-      })
-      .addCase(sendMessage.fulfilled, (state, action) => {
-        const activeChat = getActiveChat(state);
-
-        state.loading = false;
-
-        if (!activeChat) {
-          return;
-        }
-
-        activeChat.messages.push({ role: "assistant", content: action.payload });
-        activeChat.updatedAt = Date.now();
-      })
-      .addCase(sendMessage.rejected, (state, action) => {
-        state.loading = false;
-        state.error = action.payload;
-      });
-  },
 });
 
 function getActiveChat(state) {
@@ -140,7 +270,17 @@ function createChatId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export const { addUserMessage, clearError, createNewChat, selectChat, setModel } =
-  chatSlice.actions;
+export const {
+  addUserMessage,
+  appendStreamingResponse,
+  clearError,
+  createNewChat,
+  failStreamingResponse,
+  finishStreamingResponse,
+  selectChat,
+  setError,
+  setModel,
+  startStreamingResponse,
+} = chatSlice.actions;
 
 export default chatSlice.reducer;

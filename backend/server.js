@@ -1,18 +1,20 @@
 import { createServer } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const ENV_PATH = resolve(process.cwd(), ".env");
 const PORT = Number(process.env.PORT || 3001);
+const MAX_MESSAGES = 50;
+const MAX_MESSAGE_LENGTH = 8000;
 
 loadEnvFile(ENV_PATH);
 
 // Each provider has slightly different request/response shapes, so the server
-// adapts them into one consistent { message } payload for the frontend.
+// adapts them into one consistent API for the frontend.
 const MODEL_CONFIG = {
   openai: {
     envKey: "OPENAI_API_KEY",
-    request: (messages) => ({
+    buildRequest: (messages, { stream = false } = {}) => ({
       url: "https://api.openai.com/v1/chat/completions",
       options: {
         method: "POST",
@@ -23,14 +25,20 @@ const MODEL_CONFIG = {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           messages,
+          stream,
         }),
       },
-      parse: (data) => data.choices?.[0]?.message?.content,
     }),
+    parse: (data) => data.choices?.[0]?.message?.content,
+    parseStreamLine: (line) => {
+      const data = JSON.parse(line);
+      return data.choices?.[0]?.delta?.content || "";
+    },
+    supportsStreaming: true,
   },
   groq: {
     envKey: "GROQ_API_KEY",
-    request: (messages) => ({
+    buildRequest: (messages, { stream = false } = {}) => ({
       url: "https://api.groq.com/openai/v1/chat/completions",
       options: {
         method: "POST",
@@ -41,14 +49,20 @@ const MODEL_CONFIG = {
         body: JSON.stringify({
           model: "llama-3.1-8b-instant",
           messages,
+          stream,
         }),
       },
-      parse: (data) => data.choices?.[0]?.message?.content,
     }),
+    parse: (data) => data.choices?.[0]?.message?.content,
+    parseStreamLine: (line) => {
+      const data = JSON.parse(line);
+      return data.choices?.[0]?.delta?.content || "";
+    },
+    supportsStreaming: true,
   },
   gemini: {
     envKey: "GEMINI_API_KEY",
-    request: (messages) => ({
+    buildRequest: (messages) => ({
       url: `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
       options: {
         method: "POST",
@@ -62,12 +76,13 @@ const MODEL_CONFIG = {
           })),
         }),
       },
-      parse: (data) => data.candidates?.[0]?.content?.parts?.[0]?.text,
     }),
+    parse: (data) => data.candidates?.[0]?.content?.parts?.[0]?.text,
+    supportsStreaming: false,
   },
   claude: {
     envKey: "CLAUDE_API_KEY",
-    request: (messages) => ({
+    buildRequest: (messages) => ({
       url: "https://api.anthropic.com/v1/messages",
       options: {
         method: "POST",
@@ -85,8 +100,9 @@ const MODEL_CONFIG = {
           })),
         }),
       },
-      parse: (data) => data.content?.[0]?.text,
     }),
+    parse: (data) => data.content?.[0]?.text,
+    supportsStreaming: false,
   },
 };
 
@@ -98,57 +114,13 @@ const server = createServer(async (request, response) => {
   }
 
   if (request.method === "POST" && request.url === "/api/chat") {
-    try {
-      const body = await readJsonBody(request);
-      const model = body?.model;
-      const messages = body?.messages;
+    await handleChatRequest(request, response, false);
+    return;
+  }
 
-      if (!MODEL_CONFIG[model]) {
-        sendJson(response, 400, { error: "Unsupported model selected." });
-        return;
-      }
-
-      if (!Array.isArray(messages) || messages.length === 0) {
-        sendJson(response, 400, { error: "At least one message is required." });
-        return;
-      }
-
-      const { envKey, request: buildRequest } = MODEL_CONFIG[model];
-      const apiKey = process.env[envKey];
-
-      if (!apiKey) {
-        sendJson(response, 500, { error: `Missing ${envKey} in server environment.` });
-        return;
-      }
-
-      const config = buildRequest(messages);
-      const upstreamResponse = await fetch(config.url, config.options);
-      const data = await upstreamResponse.json();
-
-      if (!upstreamResponse.ok) {
-        const errorMessage =
-          data?.error?.message ||
-          data?.error ||
-          data?.message ||
-          "Provider request failed.";
-
-        sendJson(response, upstreamResponse.status, { error: errorMessage });
-        return;
-      }
-
-      const message = config.parse(data);
-
-      if (!message) {
-        sendJson(response, 502, { error: "Provider returned an empty response." });
-        return;
-      }
-
-      sendJson(response, 200, { message });
-      return;
-    } catch (error) {
-      sendJson(response, 500, { error: error.message || "Server error." });
-      return;
-    }
+  if (request.method === "POST" && request.url === "/api/chat/stream") {
+    await handleChatRequest(request, response, true);
+    return;
   }
 
   sendJson(response, 404, { error: "Not found." });
@@ -157,6 +129,201 @@ const server = createServer(async (request, response) => {
 server.listen(PORT, () => {
   console.log(`Chat API server listening on http://localhost:${PORT}`);
 });
+
+async function handleChatRequest(request, response, shouldStream) {
+  try {
+    const body = await readJsonBody(request);
+    const model = body?.model;
+    const rawMessages = body?.messages;
+
+    if (!MODEL_CONFIG[model]) {
+      sendJson(response, 400, { error: "Unsupported model selected." });
+      return;
+    }
+
+    const messages = validateMessages(rawMessages);
+    const config = MODEL_CONFIG[model];
+    const apiKey = process.env[config.envKey];
+
+    if (!apiKey) {
+      sendJson(response, 500, { error: `Missing ${config.envKey} in server environment.` });
+      return;
+    }
+
+    if (shouldStream) {
+      await streamProviderResponse(response, config, messages);
+      return;
+    }
+
+    const upstreamConfig = config.buildRequest(messages);
+    const upstreamResponse = await fetch(upstreamConfig.url, upstreamConfig.options);
+    const data = await upstreamResponse.json();
+
+    if (!upstreamResponse.ok) {
+      sendJson(response, upstreamResponse.status, {
+        error: extractProviderError(data),
+      });
+      return;
+    }
+
+    const message = config.parse(data);
+
+    if (!message) {
+      sendJson(response, 502, { error: "Provider returned an empty response." });
+      return;
+    }
+
+    sendJson(response, 200, { message });
+  } catch (error) {
+    sendJson(response, 500, { error: error.message || "Server error." });
+  }
+}
+
+async function streamProviderResponse(response, config, messages) {
+  if (!config.supportsStreaming) {
+    const upstreamConfig = config.buildRequest(messages);
+    const upstreamResponse = await fetch(upstreamConfig.url, upstreamConfig.options);
+    const data = await upstreamResponse.json();
+
+    if (!upstreamResponse.ok) {
+      sendSse(response, {
+        type: "error",
+        error: extractProviderError(data),
+      });
+      response.end();
+      return;
+    }
+
+    const message = config.parse(data);
+
+    if (message) {
+      sendSse(response, { type: "delta", delta: message });
+    }
+
+    sendSse(response, { type: "done" });
+    response.end();
+    return;
+  }
+
+  response.writeHead(200, {
+    ...corsHeaders(),
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+  });
+
+  const upstreamConfig = config.buildRequest(messages, { stream: true });
+  const upstreamResponse = await fetch(upstreamConfig.url, upstreamConfig.options);
+
+  if (!upstreamResponse.ok) {
+    const data = await upstreamResponse.json();
+    sendSse(response, {
+      type: "error",
+      error: extractProviderError(data),
+    });
+    response.end();
+    return;
+  }
+
+  if (!upstreamResponse.body) {
+    sendSse(response, {
+      type: "error",
+      error: "Streaming response body was unavailable.",
+    });
+    response.end();
+    return;
+  }
+
+  const reader = upstreamResponse.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || "";
+
+    for (const event of events) {
+      const dataLines = event
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .filter(Boolean);
+
+      for (const line of dataLines) {
+        if (line === "[DONE]") {
+          sendSse(response, { type: "done" });
+          response.end();
+          return;
+        }
+
+        try {
+          const delta = config.parseStreamLine(line);
+
+          if (delta) {
+            sendSse(response, { type: "delta", delta });
+          }
+        } catch {
+          // Ignore malformed stream lines and continue consuming the provider stream.
+        }
+      }
+    }
+  }
+
+  sendSse(response, { type: "done" });
+  response.end();
+}
+
+function validateMessages(rawMessages) {
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+    throw new Error("At least one message is required.");
+  }
+
+  if (rawMessages.length > MAX_MESSAGES) {
+    throw new Error(`Too many messages. Limit the request to ${MAX_MESSAGES} items.`);
+  }
+
+  return rawMessages.map((message, index) => {
+    const role = message?.role;
+    const content = sanitizeMessageContent(message?.content);
+
+    if (!["user", "assistant", "system"].includes(role)) {
+      throw new Error(`Message ${index + 1} has an unsupported role.`);
+    }
+
+    if (!content) {
+      throw new Error(`Message ${index + 1} must include text content.`);
+    }
+
+    if (content.length > MAX_MESSAGE_LENGTH) {
+      throw new Error(
+        `Message ${index + 1} is too long. Keep each message under ${MAX_MESSAGE_LENGTH} characters.`,
+      );
+    }
+
+    return {
+      role,
+      content,
+    };
+  });
+}
+
+function sanitizeMessageContent(content) {
+  return String(content || "")
+    .replace(/\u0000/g, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+}
+
+function extractProviderError(data) {
+  return data?.error?.message || data?.error || data?.message || "Provider request failed.";
+}
 
 function corsHeaders() {
   return {
@@ -172,6 +339,10 @@ function sendJson(response, statusCode, payload) {
     "Content-Type": "application/json",
   });
   response.end(JSON.stringify(payload));
+}
+
+function sendSse(response, payload) {
+  response.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 function loadEnvFile(filePath) {

@@ -4,8 +4,6 @@ import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
 
-let mermaidInitialized = false;
-
 function MermaidBlock({ chart, theme }) {
   const [svg, setSvg] = useState("");
   const [error, setError] = useState("");
@@ -16,27 +14,40 @@ function MermaidBlock({ chart, theme }) {
   );
 
   useEffect(() => {
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: theme === "dark" ? "dark" : "default",
+      securityLevel: "loose",
+    });
+  }, [theme]);
+
+  useEffect(() => {
+    let isMounted = true;
+
     async function renderChart() {
       try {
-        // Mermaid should only be initialized once in the browser runtime.
-        if (!mermaidInitialized) {
-          mermaid.initialize({
-            startOnLoad: false,
-            theme: theme === "dark" ? "dark" : "default",
-            securityLevel: "loose",
-          });
-          mermaidInitialized = true;
+        const { svg: renderedSvg } = await mermaid.render(chartId, chart);
+
+        if (!isMounted) {
+          return;
         }
 
-        const { svg: renderedSvg } = await mermaid.render(chartId, chart);
         setSvg(renderedSvg);
         setError("");
       } catch {
+        if (!isMounted) {
+          return;
+        }
+
         setError("Unable to render diagram.");
       }
     }
 
     renderChart();
+
+    return () => {
+      isMounted = false;
+    };
   }, [chart, chartId, theme]);
 
   if (error) {
